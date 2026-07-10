@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { Application } from "@splinetool/runtime";
 import type { LocationId } from "@/config/locations";
+import type { CriticalityLevel } from "@/config/intelligenceData";
 
 export type RailView = "globe" | "layers" | "reports" | "search" | "settings";
 export type LayerChip = "ports" | "energy" | "air" | "waterways";
@@ -36,6 +37,17 @@ export interface CustomPin {
   createdAt: number;
 }
 
+// Phase C — live alert
+export interface ActiveAlert {
+  id: string;
+  locationId: LocationId;
+  locationName: string;
+  criticality: CriticalityLevel;
+  headline: string;
+  timestamp: number;
+  dismissed: boolean;
+}
+
 // Phase 6 — Incident reports (session-only history).
 export interface GeneratedReport {
   id: string;
@@ -68,6 +80,11 @@ interface DashboardState {
   // Phase 6
   reportDraftOpen: boolean;
   reports: GeneratedReport[];
+
+  // Phase C — alerts
+  activeAlerts: ActiveAlert[];
+  dismissAlert: (id: string) => void;
+  initAlerts: () => void;
 
   setActiveView: (view: RailView) => void;
   toggleLayersPanel: () => void;
@@ -108,6 +125,8 @@ export const useDashboardStore = create<DashboardState>((set) => ({
   reportQueue: [],
   reportDraftOpen: false,
   reports: [],
+
+  activeAlerts: [],
 
   setActiveView: (view) =>
     set((state) => ({
@@ -163,4 +182,32 @@ export const useDashboardStore = create<DashboardState>((set) => ({
   },
   deleteReport: (id) =>
     set((state) => ({ reports: state.reports.filter((r) => r.id !== id) })),
+
+  dismissAlert: (id) =>
+    set((state) => ({
+      activeAlerts: state.activeAlerts.map((a) => (a.id === id ? { ...a, dismissed: true } : a)),
+    })),
+  initAlerts: () => {
+    import("@/config/intelligenceData").then(({ LOCATION_INTELLIGENCE }) => {
+      import("@/config/locations").then(({ LOCATIONS }) => {
+        const alerts: ActiveAlert[] = [];
+        for (const loc of LOCATIONS) {
+          const intel = LOCATION_INTELLIGENCE[loc.id];
+          if (!intel) continue;
+          if (intel.criticality === "HIGH" || intel.criticality === "SEVERE") {
+            alerts.push({
+              id: `alert-${loc.id}`,
+              locationId: loc.id,
+              locationName: loc.name,
+              criticality: intel.criticality,
+              headline: intel.news[0]?.headline ?? intel.criticalityJustification,
+              timestamp: Date.now(),
+              dismissed: false,
+            });
+          }
+        }
+        set({ activeAlerts: alerts });
+      });
+    });
+  },
 }));

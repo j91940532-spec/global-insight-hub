@@ -1,27 +1,34 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import Globe from "react-globe.gl";
 import type { GlobeMethods } from "react-globe.gl";
+import * as THREE from "three";
 import { RotateCcw, Crosshair, X, Trash2, FilePlus, MapPin as PinIcon } from "lucide-react";
 import { useDashboardStore, PIN_CATEGORY_META, type PinCategory } from "@/store/dashboardStore";
 import { getLocation, LOCATIONS, type Location } from "@/config/locations";
+import {
+  PORT_POINTS,
+  ENERGY_POINTS,
+  AIR_ROUTES,
+  WATERWAY_PATHS,
+  type PortPoint,
+  type EnergyPoint,
+  type ArcRoute,
+  type WaterwayPath,
+} from "@/config/layerOverlayData";
 import Legend from "./Legend";
-
-/**
- * Phase A — real WebGL globe (react-globe.gl / three-globe).
- *
- * Replaces the previous Spline scene. Pins and chokepoint hotspots are
- * anchored via real lat/lng and rendered by three-globe, so they stay glued
- * to the sphere through rotation, drag, and zoom. Camera fly-to uses
- * react-globe.gl's `pointOfView` for smooth transitions.
- */
 
 const DEFAULT_POV = { lat: 20, lng: 20, altitude: 2.4 };
 const CYAN = "#2DE5D9";
 const AMBER = "#FFB020";
 const DARK_EARTH = "//unpkg.com/three-globe/example/img/earth-dark.jpg";
 
-// Idle auto-rotation: on when user is not interacting; resumes ~3s after last input.
 const IDLE_RESUME_MS = 3000;
+
+// Layer accent colors
+const COLOR_PORTS = "#2DE5D9"; // cyan
+const COLOR_ENERGY = "#FFB020"; // amber
+const COLOR_AIR = "#A78BFA"; // violet
+const COLOR_WATERWAY = "#34D399"; // emerald
 
 interface GlobePoint {
   kind: "hotspot" | "pin";
@@ -71,6 +78,58 @@ function ScanLoader() {
   );
 }
 
+// Inject a THREE.Points starfield into the globe's underlying scene
+function addStarfield(scene: THREE.Scene) {
+  const count = 2400;
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  const sizes = new Float32Array(count);
+
+  for (let i = 0; i < count; i++) {
+    // Random point on a sphere with large radius so it's always behind the globe
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    const r = 900 + Math.random() * 200;
+    positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+    positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+    positions[i * 3 + 2] = r * Math.cos(phi);
+
+    // Mostly white/pale-blue, low opacity encoded as brightness
+    const isCyan = Math.random() < 0.15;
+    if (isCyan) {
+      colors[i * 3] = 0.45;
+      colors[i * 3 + 1] = 0.9;
+      colors[i * 3 + 2] = 0.85;
+    } else {
+      const b = 0.55 + Math.random() * 0.45;
+      colors[i * 3] = b;
+      colors[i * 3 + 1] = b;
+      colors[i * 3 + 2] = b + 0.05;
+    }
+
+    // Mostly tiny, some slightly larger
+    sizes[i] = Math.random() < 0.06 ? 2.2 : 0.9 + Math.random() * 0.8;
+  }
+
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute("size", new THREE.BufferAttribute(sizes, 1));
+
+  const material = new THREE.PointsMaterial({
+    size: 1.4,
+    vertexColors: true,
+    sizeAttenuation: false,
+    transparent: true,
+    opacity: 0.55,
+    depthWrite: false,
+  });
+
+  const stars = new THREE.Points(geometry, material);
+  stars.name = "orbital-starfield";
+  scene.add(stars);
+}
+
 function MainCanvas() {
   const {
     selectedLocationId,
@@ -85,6 +144,7 @@ function MainCanvas() {
     removePin,
     queuePinForReport,
     reportQueue,
+    activeChips,
   } = useDashboardStore();
 
   const globeRef = useRef<GlobeMethods | undefined>(undefined);
@@ -93,8 +153,9 @@ function MainCanvas() {
   const [ready, setReady] = useState(false);
   const [draft, setDraft] = useState<{ lat: number; lng: number } | null>(null);
   const idleTimerRef = useRef<number | null>(null);
+  const starfieldAddedRef = useRef(false);
 
-  // Responsive sizing.
+  // Responsive sizing
   useEffect(() => {
     if (!containerRef.current) return;
     const el = containerRef.current;
@@ -106,7 +167,7 @@ function MainCanvas() {
     return () => ro.disconnect();
   }, []);
 
-  // Configure controls once the globe is mounted.
+  // Configure controls once the globe is mounted
   const handleGlobeReady = useCallback(() => {
     const g = globeRef.current;
     if (!g) return;
@@ -134,10 +195,20 @@ function MainCanvas() {
       }, IDLE_RESUME_MS);
     });
     g.pointOfView(DEFAULT_POV, 0);
+
+    // Add starfield to Three.js scene (one-time)
+    if (!starfieldAddedRef.current) {
+      const scene = g.scene() as unknown as THREE.Scene;
+      if (scene) {
+        addStarfield(scene);
+        starfieldAddedRef.current = true;
+      }
+    }
+
     setReady(true);
   }, []);
 
-  // Fly-to when a chokepoint is selected (e.g. via search or panel).
+  // Fly-to when a chokepoint is selected
   useEffect(() => {
     if (!ready || !globeRef.current) return;
     const loc = getLocation(selectedLocationId);
@@ -145,7 +216,8 @@ function MainCanvas() {
     globeRef.current.pointOfView({ lat: loc.lat, lng: loc.lon, altitude: 0.9 }, 1500);
   }, [selectedLocationId, ready]);
 
-  const points = useMemo<GlobePoint[]>(() => {
+  // ── Hotspot + custom pin points ──────────────────────────────────────────────
+  const hotspotAndPinPoints = useMemo<GlobePoint[]>(() => {
     const hotspotPoints: GlobePoint[] = LOCATIONS.map((loc: Location) => ({
       kind: "hotspot",
       id: loc.id,
@@ -173,6 +245,32 @@ function MainCanvas() {
       });
     return [...hotspotPoints, ...pinPoints];
   }, [pins, visibleCategories]);
+
+  // ── Layer overlay data — driven by activeChips toggles ──────────────────────
+
+  // Ports layer — point markers
+  const portPoints = useMemo<PortPoint[]>(
+    () => (activeChips.ports ? PORT_POINTS : []),
+    [activeChips.ports],
+  );
+
+  // Energy layer — point markers
+  const energyPoints = useMemo<EnergyPoint[]>(
+    () => (activeChips.energy ? ENERGY_POINTS : []),
+    [activeChips.energy],
+  );
+
+  // Air routes layer — arcs
+  const airArcs = useMemo<ArcRoute[]>(
+    () => (activeChips.air ? AIR_ROUTES : []),
+    [activeChips.air],
+  );
+
+  // Waterways layer — paths
+  const waterwayPaths = useMemo<WaterwayPath[]>(
+    () => (activeChips.waterways ? WATERWAY_PATHS : []),
+    [activeChips.waterways],
+  );
 
   const rings = useMemo(
     () =>
@@ -234,7 +332,9 @@ function MainCanvas() {
             atmosphereAltitude={0.18}
             onGlobeReady={handleGlobeReady}
             onGlobeClick={handleGlobeClick}
-            pointsData={points}
+
+            // ── Hotspots + custom pins ──
+            pointsData={hotspotAndPinPoints}
             pointLat={(d: object) => (d as GlobePoint).lat}
             pointLng={(d: object) => (d as GlobePoint).lng}
             pointColor={(d: object) => (d as GlobePoint).color}
@@ -245,11 +345,61 @@ function MainCanvas() {
               return `<div style="font-family:ui-monospace,monospace;font-size:10px;letter-spacing:0.1em;padding:6px 10px;background:rgba(10,14,20,0.95);border:1px solid ${p.color}66;color:${p.color};text-transform:uppercase;box-shadow:0 0 12px ${p.glow}">${p.label}</div>`;
             }}
             onPointClick={handlePointClick}
+
+            // ── Rings ──
             ringsData={rings}
             ringColor={() => "rgba(45,229,217,0.6)"}
             ringMaxRadius="maxR"
             ringPropagationSpeed="propagationSpeed"
             ringRepeatPeriod="repeatPeriod"
+
+            // ── Port + Energy layer (objectsData — auto-positioned by lat/lng) ──
+            objectsData={[
+              ...portPoints.map((p) => ({ ...p, _layer: "port" })),
+              ...energyPoints.map((p) => ({ ...p, _layer: "energy" })),
+            ]}
+            objectLat={(d: object) => (d as PortPoint & { _layer: string }).lat}
+            objectLng={(d: object) => (d as PortPoint & { _layer: string }).lng}
+            objectAltitude={0.01}
+            objectThreeObject={(d: object) => {
+              const item = d as (PortPoint | EnergyPoint) & { _layer: string };
+              const color = item._layer === "port" ? COLOR_PORTS : COLOR_ENERGY;
+              const geo = new THREE.SphereGeometry(0.28, 8, 8);
+              const mat = new THREE.MeshBasicMaterial({ color });
+              return new THREE.Mesh(geo, mat);
+            }}
+            objectLabel={(d: object) => {
+              const item = d as (PortPoint | EnergyPoint) & { _layer: string };
+              const color = item._layer === "port" ? COLOR_PORTS : COLOR_ENERGY;
+              return `<div style="font-family:ui-monospace,monospace;font-size:10px;padding:4px 8px;background:rgba(10,14,20,0.95);border:1px solid ${color}66;color:${color};text-transform:uppercase">${item.name}</div>`;
+            }}
+
+            // ── Air routes (arcs) ──
+            arcsData={airArcs}
+            arcStartLat={(d: object) => (d as ArcRoute).startLat}
+            arcStartLng={(d: object) => (d as ArcRoute).startLng}
+            arcEndLat={(d: object) => (d as ArcRoute).endLat}
+            arcEndLng={(d: object) => (d as ArcRoute).endLng}
+            arcColor={() => `${COLOR_AIR}99`}
+            arcAltitude={0.12}
+            arcStroke={0.4}
+            arcLabel={(d: object) => {
+              const a = d as ArcRoute;
+              return `<div style="font-family:ui-monospace,monospace;font-size:10px;padding:4px 8px;background:rgba(10,14,20,0.95);border:1px solid ${COLOR_AIR}66;color:${COLOR_AIR}">${a.label}</div>`;
+            }}
+
+            // ── Waterways (paths) ──
+            pathsData={waterwayPaths}
+            pathPoints="coords"
+            pathPointLat={(coord: unknown) => (coord as [number, number])[0]}
+            pathPointLng={(coord: unknown) => (coord as [number, number])[1]}
+            pathColor={() => `${COLOR_WATERWAY}cc`}
+            pathStroke={1.2}
+            pathAltitude={0.005}
+            pathLabel={(d: object) => {
+              const w = d as WaterwayPath;
+              return `<div style="font-family:ui-monospace,monospace;font-size:10px;padding:4px 8px;background:rgba(10,14,20,0.95);border:1px solid ${COLOR_WATERWAY}66;color:${COLOR_WATERWAY}">${w.label}</div>`;
+            }}
           />
         )}
         {!ready && <ScanLoader />}
@@ -279,7 +429,7 @@ function MainCanvas() {
         </div>
       )}
 
-      {/* Pin draft dialog — centered since the click was on a 3D globe */}
+      {/* Pin draft dialog */}
       {draft && (
         <PinDraftDialog
           lat={draft.lat}
