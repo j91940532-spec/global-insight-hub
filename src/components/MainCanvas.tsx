@@ -395,7 +395,7 @@ function MainCanvas() {
             pathPointLng={(coord: unknown) => (coord as [number, number])[1]}
             pathColor={() => `${COLOR_WATERWAY}cc`}
             pathStroke={1.2}
-            pathAltitude={0.005}
+            pathPointAlt={() => 0.005}
             pathLabel={(d: object) => {
               const w = d as WaterwayPath;
               return `<div style="font-family:ui-monospace,monospace;font-size:10px;padding:4px 8px;background:rgba(10,14,20,0.95);border:1px solid ${COLOR_WATERWAY}66;color:${COLOR_WATERWAY}">${w.label}</div>`;
