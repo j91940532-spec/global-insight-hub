@@ -1,30 +1,43 @@
-import { Suspense, useState, useEffect, useRef, useCallback } from "react";
-import Spline from "@splinetool/react-spline";
-import type { Application } from "@splinetool/runtime";
-import { RefreshCw, AlertTriangle, RotateCcw, Crosshair } from "lucide-react";
-import gsap from "gsap";
-import { useDashboardStore } from "@/store/dashboardStore";
-import { getLocation, LOCATIONS } from "@/config/locations";
-import HotspotOverlays from "./HotspotOverlays";
-import PinOverlays, { PinDraftDialog } from "./PinOverlays";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import Globe from "react-globe.gl";
+import type { GlobeMethods } from "react-globe.gl";
+import { RotateCcw, Crosshair, X, Trash2, FilePlus, MapPin as PinIcon } from "lucide-react";
+import { useDashboardStore, PIN_CATEGORY_META, type PinCategory } from "@/store/dashboardStore";
+import { getLocation, LOCATIONS, type Location } from "@/config/locations";
 import Legend from "./Legend";
 
-const SCENE_URL = import.meta.env.VITE_SPLINE_SCENE_URL as string | undefined;
+/**
+ * Phase A — real WebGL globe (react-globe.gl / three-globe).
+ *
+ * Replaces the previous Spline scene. Pins and chokepoint hotspots are
+ * anchored via real lat/lng and rendered by three-globe, so they stay glued
+ * to the sphere through rotation, drag, and zoom. Camera fly-to uses
+ * react-globe.gl's `pointOfView` for smooth transitions.
+ */
 
-type LoadState = "loading" | "ready" | "error";
+const DEFAULT_POV = { lat: 20, lng: 20, altitude: 2.4 };
+const CYAN = "#2DE5D9";
+const AMBER = "#FFB020";
+const DARK_EARTH = "//unpkg.com/three-globe/example/img/earth-dark.jpg";
 
-// Illustrative equirectangular projection of normalized screen (0..1)
-// to approximate lat/lon — flagged as approximate in the pin UI since
-// the underlying Spline scene is a 3D globe, not a flat map.
-function screenToLatLon(sx: number, sy: number) {
-  return { lat: (0.5 - sy) * 180, lon: (sx - 0.5) * 360 };
+// Idle auto-rotation: on when user is not interacting; resumes ~3s after last input.
+const IDLE_RESUME_MS = 3000;
+
+interface GlobePoint {
+  kind: "hotspot" | "pin";
+  id: string;
+  lat: number;
+  lng: number;
+  color: string;
+  glow: string;
+  label: string;
+  size: number;
 }
-
 
 function GridTexture() {
   return (
     <div
-      className="absolute inset-0"
+      className="absolute inset-0 pointer-events-none"
       style={{
         backgroundImage:
           "linear-gradient(rgba(45,229,217,0.04) 1px, transparent 1px), linear-gradient(90deg, rgba(45,229,217,0.04) 1px, transparent 1px)",
@@ -36,7 +49,7 @@ function GridTexture() {
 
 function ScanLoader() {
   return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center gap-6">
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 pointer-events-none">
       <GridTexture />
       <div className="relative w-24 h-24">
         <div className="absolute inset-0 rounded-full" style={{ border: "1px solid rgba(45,229,217,0.2)" }} />
@@ -50,268 +63,210 @@ function ScanLoader() {
             animationDuration: "1.2s",
           }}
         />
-        <div
-          className="absolute inset-0 rounded-full"
-          style={{ border: "1px solid rgba(45,229,217,0.4)", boxShadow: "inset 0 0 12px rgba(45,229,217,0.15)" }}
-        />
-        <div className="absolute inset-0 flex items-center justify-center">
-          <span className="w-1.5 h-1.5 rounded-full bg-accent-cyan animate-pulse" style={{ boxShadow: "0 0 8px var(--accent-cyan)" }} />
-        </div>
       </div>
-      <div className="flex flex-col items-center gap-1">
-        <span className="font-mono text-xs text-accent-cyan tracking-widest" style={{ textShadow: "0 0 8px rgba(45,229,217,0.4)" }}>
-          INITIALIZING GLOBE FEED<span className="animate-pulse">...</span>
-        </span>
-        <span className="font-mono text-[10px] text-zinc-600">ACQUIRING SATELLITE UPLINK</span>
-      </div>
+      <span className="font-mono text-xs text-accent-cyan tracking-widest">
+        INITIALIZING GLOBE FEED<span className="animate-pulse">...</span>
+      </span>
     </div>
   );
-}
-
-function ErrorPanel({ onRetry }: { onRetry: () => void }) {
-  return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
-      <GridTexture />
-      <AlertTriangle className="w-10 h-10 text-amber-400" strokeWidth={1.5} style={{ filter: "drop-shadow(0 0 8px rgba(255,176,32,0.5))" }} />
-      <div className="flex flex-col items-center gap-1">
-        <span className="font-mono text-sm text-amber-400 tracking-wider">SCENE LOAD FAILURE</span>
-        <span className="font-mono text-[10px] text-zinc-500">Globe feed could not be established</span>
-      </div>
-      <button
-        onClick={onRetry}
-        className="flex items-center gap-2 px-4 py-2 font-mono text-xs text-accent-cyan transition-all duration-150 hover:bg-accent-cyan/10"
-        style={{ border: "1px solid var(--border-hair)" }}
-      >
-        <RefreshCw className="w-3.5 h-3.5" />
-        RETRY UPLINK
-      </button>
-    </div>
-  );
-}
-
-function PlaceholderCanvas() {
-  return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
-      <GridTexture />
-      <div className="relative">
-        <div className="w-16 h-16 rounded-full" style={{ border: "1px dashed rgba(45,229,217,0.3)" }} />
-        <div className="absolute inset-0 flex items-center justify-center">
-          <div className="w-3 h-3 rounded-full bg-accent-cyan/30 animate-pulse" />
-        </div>
-      </div>
-      <span className="font-mono text-xs text-zinc-600 tracking-widest">GLOBE VIEWPORT</span>
-      <span className="font-mono text-[10px] text-zinc-700">SPLINE_SCENE_URL not configured</span>
-    </div>
-  );
-}
-
-// Default camera baseline captured at scene load; used by Reset View.
-interface CameraSnapshot {
-  position: { x: number; y: number; z: number };
-  rotation: { x: number; y: number; z: number };
 }
 
 function MainCanvas() {
   const {
-    setSplineApp,
-    splineApp,
     selectedLocationId,
     selectLocation,
     addPinMode,
     toggleAddPinMode,
     addPin,
+    pins,
+    visibleCategories,
+    selectedPinId,
+    selectPin,
+    removePin,
+    queuePinForReport,
+    reportQueue,
   } = useDashboardStore();
-  const [loadState, setLoadState] = useState<LoadState>(SCENE_URL ? "loading" : "ready");
-  const [retryKey, setRetryKey] = useState(0);
-  const [hasScene, setHasScene] = useState(!!SCENE_URL);
-  const [draft, setDraft] = useState<{ x: number; y: number } | null>(null);
-  const sceneRef = useRef<HTMLDivElement>(null);
-  const defaultCamRef = useRef<CameraSnapshot | null>(null);
 
+  const globeRef = useRef<GlobeMethods | undefined>(undefined);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [dims, setDims] = useState({ w: 0, h: 0 });
+  const [ready, setReady] = useState(false);
+  const [draft, setDraft] = useState<{ lat: number; lng: number } | null>(null);
+  const idleTimerRef = useRef<number | null>(null);
 
+  // Responsive sizing.
   useEffect(() => {
-    setHasScene(!!SCENE_URL);
-  }, [retryKey]);
+    if (!containerRef.current) return;
+    const el = containerRef.current;
+    const ro = new ResizeObserver(() => {
+      setDims({ w: el.clientWidth, h: el.clientHeight });
+    });
+    ro.observe(el);
+    setDims({ w: el.clientWidth, h: el.clientHeight });
+    return () => ro.disconnect();
+  }, []);
 
-  const handleLoad = useCallback(
-    (app: Application) => {
-      setSplineApp(app);
-      setLoadState("ready");
-      try {
-        const objects = app.getAllObjects();
-        const names = objects.map((o) => o.name).filter(Boolean);
-        console.log("[Spline] Scene loaded. Object count:", objects.length);
-        console.log("[Spline] Object names:", names);
+  // Configure controls once the globe is mounted.
+  const handleGlobeReady = useCallback(() => {
+    const g = globeRef.current;
+    if (!g) return;
+    const controls = g.controls() as unknown as {
+      autoRotate: boolean;
+      autoRotateSpeed: number;
+      enableZoom: boolean;
+      enablePan: boolean;
+      minDistance: number;
+      maxDistance: number;
+      addEventListener: (ev: string, cb: () => void) => void;
+    };
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 0.35;
+    controls.enableZoom = true;
+    controls.enablePan = false;
+    controls.addEventListener("start", () => {
+      controls.autoRotate = false;
+      if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
+    });
+    controls.addEventListener("end", () => {
+      if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = window.setTimeout(() => {
+        controls.autoRotate = true;
+      }, IDLE_RESUME_MS);
+    });
+    g.pointOfView(DEFAULT_POV, 0);
+    setReady(true);
+  }, []);
 
-        // Capture default camera pose for Reset View. Spline exposes the
-        // camera as a named object; if not present we fall back to overlay-only.
-        const cam =
-          app.findObjectByName("Camera") ??
-          objects.find((o) => o.name?.toLowerCase().includes("camera"));
-        if (cam) {
-          defaultCamRef.current = {
-            position: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
-            rotation: { x: cam.rotation.x, y: cam.rotation.y, z: cam.rotation.z },
-          };
-          console.log("[Spline] Camera baseline captured:", defaultCamRef.current);
-        } else {
-          console.warn("[Spline] No Camera object found — Reset View will only clear panel.");
-        }
-
-        // Attempt to attach real Spline object click handlers when hotspot
-        // marker objects exist in the scene. Currently none of the locations
-        // define splineObjectName (all null), so this loop is a no-op today
-        // and safely activates when hotspots are added in the Spline editor.
-        LOCATIONS.forEach((loc) => {
-          if (!loc.splineObjectName) return;
-          const obj = app.findObjectByName(loc.splineObjectName);
-          if (obj) {
-            app.addEventListener("mouseDown", (e: { target?: { name?: string } }) => {
-              if (e.target?.name === loc.splineObjectName) selectLocation(loc.id);
-            });
-          } else {
-            console.warn(`[Spline] Hotspot object "${loc.splineObjectName}" not found in scene.`);
-          }
-        });
-      } catch (e) {
-        console.warn("[Spline] Could not enumerate objects", e);
-      }
-    },
-    [setSplineApp, selectLocation],
-  );
-
-  // Camera fly-to on selection change.
+  // Fly-to when a chokepoint is selected (e.g. via search or panel).
   useEffect(() => {
-    if (!splineApp) return;
+    if (!ready || !globeRef.current) return;
     const loc = getLocation(selectedLocationId);
     if (!loc) return;
+    globeRef.current.pointOfView({ lat: loc.lat, lng: loc.lon, altitude: 0.9 }, 1500);
+  }, [selectedLocationId, ready]);
 
-    const cam =
-      splineApp.findObjectByName("Camera") ??
-      splineApp.getAllObjects().find((o) => o.name?.toLowerCase().includes("camera"));
+  const points = useMemo<GlobePoint[]>(() => {
+    const hotspotPoints: GlobePoint[] = LOCATIONS.map((loc: Location) => ({
+      kind: "hotspot",
+      id: loc.id,
+      lat: loc.lat,
+      lng: loc.lon,
+      color: CYAN,
+      glow: "rgba(45,229,217,0.6)",
+      label: loc.name,
+      size: 0.55,
+    }));
+    const pinPoints: GlobePoint[] = pins
+      .filter((p) => visibleCategories[p.category])
+      .map((p) => {
+        const meta = PIN_CATEGORY_META[p.category];
+        return {
+          kind: "pin",
+          id: p.id,
+          lat: p.lat,
+          lng: p.lon,
+          color: meta.color,
+          glow: meta.glow,
+          label: p.label,
+          size: 0.4,
+        };
+      });
+    return [...hotspotPoints, ...pinPoints];
+  }, [pins, visibleCategories]);
 
-    if (!cam) {
-      console.warn(
-        "[Phase 4] Camera fly-to requested but no Camera object exists in the Spline scene. " +
-          "Add a named 'Camera' object in the Spline editor to enable cinematic zoom.",
-      );
-      return;
-    }
+  const rings = useMemo(
+    () =>
+      LOCATIONS.map((loc) => ({
+        lat: loc.lat,
+        lng: loc.lon,
+        maxR: 4,
+        propagationSpeed: 2,
+        repeatPeriod: 1800,
+      })),
+    [],
+  );
 
-    gsap.to(cam.position, {
-      x: loc.cameraTarget.position.x,
-      y: loc.cameraTarget.position.y,
-      z: loc.cameraTarget.position.z,
-      duration: 1.5,
-      ease: "power3.inOut",
-    });
-    gsap.to(cam.rotation, {
-      x: loc.cameraTarget.rotation.x,
-      y: loc.cameraTarget.rotation.y,
-      z: loc.cameraTarget.rotation.z,
-      duration: 1.5,
-      ease: "power3.inOut",
-    });
-  }, [selectedLocationId, splineApp]);
+  const handlePointClick = useCallback(
+    (point: object) => {
+      const p = point as GlobePoint;
+      if (p.kind === "hotspot") {
+        selectLocation(p.id as (typeof LOCATIONS)[number]["id"]);
+      } else {
+        selectPin(p.id);
+        const pin = pins.find((x) => x.id === p.id);
+        if (pin) {
+          globeRef.current?.pointOfView({ lat: pin.lat, lng: pin.lon, altitude: 0.9 }, 1400);
+        }
+      }
+    },
+    [selectLocation, selectPin, pins],
+  );
+
+  const handleGlobeClick = useCallback(
+    ({ lat, lng }: { lat: number; lng: number }) => {
+      if (addPinMode) {
+        setDraft({ lat, lng });
+      }
+    },
+    [addPinMode],
+  );
 
   const handleReset = () => {
-    if (splineApp && defaultCamRef.current) {
-      const cam =
-        splineApp.findObjectByName("Camera") ??
-        splineApp.getAllObjects().find((o) => o.name?.toLowerCase().includes("camera"));
-      if (cam) {
-        gsap.to(cam.position, { ...defaultCamRef.current.position, duration: 1.3, ease: "power3.inOut" });
-        gsap.to(cam.rotation, { ...defaultCamRef.current.rotation, duration: 1.3, ease: "power3.inOut" });
-      }
-    }
+    globeRef.current?.pointOfView(DEFAULT_POV, 1300);
     selectLocation(null);
+    selectPin(null);
   };
 
-  const handleRetry = () => {
-    setLoadState("loading");
-    setRetryKey((k) => k + 1);
-  };
-
-  const handleCanvasClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!addPinMode || loadState !== "ready") return;
-    // Ignore clicks on overlay children (hotspots, existing pins).
-    if ((e.target as HTMLElement).closest("[data-overlay-marker]")) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width;
-    const y = (e.clientY - rect.top) / rect.height;
-    setDraft({ x, y });
-  };
+  const selectedPin = pins.find((p) => p.id === selectedPinId) ?? null;
 
   return (
-    <main
-      className="relative h-full w-full overflow-hidden bg-bg-base"
-      style={{ cursor: addPinMode ? "crosshair" : "default" }}
-      onClick={handleCanvasClick}
-    >
-      <div ref={sceneRef} className="absolute inset-0">
-        {hasScene && loadState !== "error" && (
-          <Suspense fallback={<ScanLoader />}>
-            <Spline
-              key={retryKey}
-              scene={SCENE_URL!}
-              onLoad={handleLoad}
-              onError={() => setLoadState("error")}
-              style={{
-                width: "100%",
-                height: "100%",
-                opacity: loadState === "ready" ? 1 : 0,
-                transition: "opacity 0.6s ease",
-              }}
-            />
-          </Suspense>
+    <main className="relative h-full w-full overflow-hidden bg-bg-base" style={{ cursor: addPinMode ? "crosshair" : "default" }}>
+      <div ref={containerRef} className="absolute inset-0">
+        {dims.w > 0 && (
+          <Globe
+            ref={globeRef}
+            width={dims.w}
+            height={dims.h}
+            backgroundColor="rgba(0,0,0,0)"
+            globeImageUrl={DARK_EARTH}
+            showAtmosphere
+            atmosphereColor={CYAN}
+            atmosphereAltitude={0.18}
+            onGlobeReady={handleGlobeReady}
+            onGlobeClick={handleGlobeClick}
+            pointsData={points}
+            pointLat={(d: object) => (d as GlobePoint).lat}
+            pointLng={(d: object) => (d as GlobePoint).lng}
+            pointColor={(d: object) => (d as GlobePoint).color}
+            pointAltitude={(d: object) => ((d as GlobePoint).kind === "hotspot" ? 0.02 : 0.015)}
+            pointRadius={(d: object) => (d as GlobePoint).size}
+            pointLabel={(d: object) => {
+              const p = d as GlobePoint;
+              return `<div style="font-family:ui-monospace,monospace;font-size:10px;letter-spacing:0.1em;padding:6px 10px;background:rgba(10,14,20,0.95);border:1px solid ${p.color}66;color:${p.color};text-transform:uppercase;box-shadow:0 0 12px ${p.glow}">${p.label}</div>`;
+            }}
+            onPointClick={handlePointClick}
+            ringsData={rings}
+            ringColor={() => "rgba(45,229,217,0.6)"}
+            ringMaxRadius="maxR"
+            ringPropagationSpeed="propagationSpeed"
+            ringRepeatPeriod="repeatPeriod"
+          />
         )}
-        {hasScene && loadState === "loading" && <ScanLoader />}
-        {hasScene && loadState === "error" && <ErrorPanel onRetry={handleRetry} />}
-        {!hasScene && <PlaceholderCanvas />}
+        {!ready && <ScanLoader />}
       </div>
 
-      {/* Phase 4: fixed chokepoint hotspots */}
-      {loadState === "ready" && (
-        <div data-overlay-marker>
-          <HotspotOverlays />
-        </div>
-      )}
-
-      {/* Phase 5: user-placed pins */}
-      {loadState === "ready" && (
-        <div data-overlay-marker>
-          <PinOverlays />
-        </div>
-      )}
-
-      {/* Phase 5: pin draft dialog */}
-      {draft && (
-        <div data-overlay-marker>
-          <PinDraftDialog
-            screen={draft}
-            onCancel={() => setDraft(null)}
-            onConfirm={(label, cat) => {
-              const { lat, lon } = screenToLatLon(draft.x, draft.y);
-              addPin({ label, category: cat, screen: draft, lat, lon });
-              setDraft(null);
-            }}
-          />
-        </div>
-      )}
-
-      {/* Phase 5: add-pin mode banner */}
+      {/* Add-pin mode banner */}
       {addPinMode && !draft && (
         <div
-          data-overlay-marker
           className="absolute top-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 px-4 py-2 pointer-events-auto"
           style={{
             background: "rgba(10,14,20,0.9)",
-            border: "1px solid var(--accent-amber)",
+            border: `1px solid ${AMBER}`,
             boxShadow: "0 0 16px rgba(255,176,32,0.3)",
           }}
         >
-          <Crosshair className="w-4 h-4 text-accent-amber" strokeWidth={1.5} />
-          <span className="font-mono text-[11px] tracking-widest text-accent-amber">
+          <Crosshair className="w-4 h-4" style={{ color: AMBER }} strokeWidth={1.5} />
+          <span className="font-mono text-[11px] tracking-widest" style={{ color: AMBER }}>
             ADD-PIN MODE — CLICK GLOBE TO DROP
           </span>
           <button
@@ -324,10 +279,77 @@ function MainCanvas() {
         </div>
       )}
 
-      {/* Phase 4: Reset View */}
-      {selectedLocationId && (
+      {/* Pin draft dialog — centered since the click was on a 3D globe */}
+      {draft && (
+        <PinDraftDialog
+          lat={draft.lat}
+          lng={draft.lng}
+          onCancel={() => setDraft(null)}
+          onConfirm={(label, cat) => {
+            addPin({
+              label,
+              category: cat,
+              lat: draft.lat,
+              lon: draft.lng,
+              screen: { x: 0.5, y: 0.5 },
+            });
+            setDraft(null);
+          }}
+        />
+      )}
+
+      {/* Selected custom pin info card */}
+      {selectedPin && (
+        <div
+          className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 w-72 pointer-events-auto"
+          style={{
+            background: "rgba(10,14,20,0.95)",
+            backdropFilter: "blur(12px)",
+            border: `1px solid ${PIN_CATEGORY_META[selectedPin.category].color}66`,
+            boxShadow: `0 0 24px ${PIN_CATEGORY_META[selectedPin.category].glow}`,
+          }}
+        >
+          <div className="flex items-center justify-between px-3 h-8" style={{ borderBottom: `1px solid ${PIN_CATEGORY_META[selectedPin.category].color}33` }}>
+            <div className="flex items-center gap-2">
+              <PinIcon className="w-3 h-3" style={{ color: PIN_CATEGORY_META[selectedPin.category].color }} />
+              <span className="font-mono text-[10px] tracking-widest" style={{ color: PIN_CATEGORY_META[selectedPin.category].color }}>
+                {PIN_CATEGORY_META[selectedPin.category].label.toUpperCase()}
+              </span>
+            </div>
+            <button onClick={() => selectPin(null)} className="text-zinc-500 hover:text-zinc-200">
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+          <div className="px-3 py-2 space-y-1">
+            <div className="font-heading text-sm text-zinc-100 truncate">{selectedPin.label}</div>
+            <div className="font-mono text-[10px] text-zinc-500 tabular-nums">
+              {selectedPin.lat.toFixed(3)}°, {selectedPin.lon.toFixed(3)}°
+            </div>
+          </div>
+          <div className="flex" style={{ borderTop: `1px solid ${PIN_CATEGORY_META[selectedPin.category].color}33` }}>
+            <button
+              onClick={() => removePin(selectedPin.id)}
+              className="flex-1 flex items-center justify-center gap-1.5 px-2 py-2 font-mono text-[10px] text-zinc-400 hover:text-red-400 hover:bg-red-500/5 transition-colors"
+            >
+              <Trash2 className="w-3 h-3" />
+              REMOVE
+            </button>
+            <button
+              onClick={() => queuePinForReport(selectedPin.id)}
+              disabled={reportQueue.includes(selectedPin.id)}
+              className="flex-1 flex items-center justify-center gap-1.5 px-2 py-2 font-mono text-[10px] text-zinc-400 hover:text-accent-cyan disabled:opacity-40 transition-colors"
+              style={{ color: reportQueue.includes(selectedPin.id) ? CYAN : undefined }}
+            >
+              <FilePlus className="w-3 h-3" />
+              {reportQueue.includes(selectedPin.id) ? "QUEUED" : "ADD TO REPORT"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Reset View */}
+      {(selectedLocationId || selectedPinId) && (
         <button
-          data-overlay-marker
           onClick={handleReset}
           className="absolute top-4 right-4 z-20 flex items-center gap-2 px-3 py-2 font-mono text-[11px] text-accent-cyan tracking-widest bg-bg-panel/80 backdrop-blur-md transition-all duration-150 hover:bg-accent-cyan/10 hover:shadow-[0_0_16px_rgba(45,229,217,0.4)]"
           style={{ border: "1px solid var(--border-hair)" }}
@@ -337,20 +359,105 @@ function MainCanvas() {
         </button>
       )}
 
-      {/* Phase 5: category legend */}
-      {loadState === "ready" && (
-        <div data-overlay-marker>
-          <Legend />
-        </div>
-      )}
+      {ready && <Legend />}
 
       <div
         className="absolute inset-0 pointer-events-none"
-        style={{ background: "radial-gradient(ellipse at center, transparent 50%, rgba(5,7,10,0.5) 100%)" }}
+        style={{ background: "radial-gradient(ellipse at center, transparent 55%, rgba(5,7,10,0.55) 100%)" }}
       />
     </main>
   );
 }
 
-export default MainCanvas;
+interface PinDraftDialogProps {
+  lat: number;
+  lng: number;
+  onConfirm: (label: string, cat: PinCategory) => void;
+  onCancel: () => void;
+}
 
+function PinDraftDialog({ lat, lng, onConfirm, onCancel }: PinDraftDialogProps) {
+  const [label, setLabel] = useState("");
+  const [cat, setCat] = useState<PinCategory>("custom");
+
+  return (
+    <div
+      className="absolute z-40 w-72 pointer-events-auto"
+      style={{
+        top: "50%",
+        left: "50%",
+        transform: "translate(-50%, -50%)",
+        background: "rgba(10,14,20,0.95)",
+        backdropFilter: "blur(12px)",
+        border: "1px solid var(--accent-cyan)",
+        boxShadow: "0 0 24px rgba(45,229,217,0.4)",
+      }}
+    >
+      <div className="flex items-center justify-between px-3 h-8" style={{ borderBottom: "1px solid rgba(45,229,217,0.3)" }}>
+        <span className="font-mono text-[10px] tracking-widest text-accent-cyan">NEW PIN</span>
+        <button onClick={onCancel} className="text-zinc-500 hover:text-zinc-200">
+          <X className="w-3 h-3" />
+        </button>
+      </div>
+      <div className="p-3 space-y-3">
+        <div className="font-mono text-[10px] text-zinc-500 tabular-nums">
+          {lat.toFixed(3)}°, {lng.toFixed(3)}°
+        </div>
+        <div>
+          <label className="block font-mono text-[10px] text-zinc-500 mb-1">LABEL_</label>
+          <input
+            autoFocus
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="e.g. Recon site A"
+            className="w-full px-2 py-1.5 font-mono text-xs bg-transparent outline-none text-zinc-100"
+            style={{ border: "1px solid rgba(45,229,217,0.3)", caretColor: "var(--accent-cyan)" }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && label.trim()) onConfirm(label.trim(), cat);
+              if (e.key === "Escape") onCancel();
+            }}
+          />
+        </div>
+        <div>
+          <label className="block font-mono text-[10px] text-zinc-500 mb-1">CATEGORY_</label>
+          <div className="grid grid-cols-5 gap-1">
+            {(Object.keys(PIN_CATEGORY_META) as PinCategory[]).map((c) => {
+              const m = PIN_CATEGORY_META[c];
+              const active = cat === c;
+              return (
+                <button
+                  key={c}
+                  onClick={() => setCat(c)}
+                  className="py-1 font-mono text-[9px] tracking-wider transition-all"
+                  style={{
+                    border: `1px solid ${active ? m.color : "rgba(45,229,217,0.15)"}`,
+                    background: active ? `${m.color}22` : "transparent",
+                    color: active ? m.color : "#71717a",
+                    boxShadow: active ? `0 0 8px ${m.glow}` : "none",
+                  }}
+                  title={m.label}
+                >
+                  {m.label.slice(0, 4).toUpperCase()}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <button
+          onClick={() => label.trim() && onConfirm(label.trim(), cat)}
+          disabled={!label.trim()}
+          className="w-full py-2 font-heading text-xs tracking-widest transition-all"
+          style={{
+            border: "1px solid var(--accent-cyan)",
+            background: label.trim() ? "transparent" : "rgba(45,229,217,0.05)",
+            color: label.trim() ? "var(--accent-cyan)" : "rgba(45,229,217,0.4)",
+          }}
+        >
+          DROP PIN
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export default MainCanvas;
